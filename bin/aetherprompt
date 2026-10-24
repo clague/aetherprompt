@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# aetherprompt — a Wayland prompt for passphrases, styled after caelestia.
+#
+# Modes:
+#   aetherprompt pinentry        speak the pinentry protocol on stdin/stdout
+#                                (used by gpg-agent, config pinentry-program)
+#   aetherprompt askpass [msg]   classic askpass: print passphrase to stdout
+#                                (SSH_ASKPASS, SUDO_ASKPASS, ssh/git/…)
+#   aetherprompt msg ...         alias of askpass
+# The UI process (quickshell) is spawned once per prompt; the passphrase is
+# handed back over a per-prompt unix socket (never on disk, argv or tty).
+# the app root is the directory holding shell.qml: when installed, the
+# script lives alongside its QML payload in /usr/lib/aetherprompt; in a
+# source checkout the script is kept in bin/, so fall back one level up
+ROOT="${AEP_ROOT:-$(dirname -- "$(readlink -f "$0")")}"
+[ -f "$ROOT/shell.qml" ] || ROOT="$(dirname -- "$ROOT")"
+
+die() { echo "aetherprompt: $*" >&2; exit 1; }
+: "${WAYLAND_DISPLAY:?not running under Wayland}"
+command -v quickshell >/dev/null || die "quickshell is required"
+command -v python3 >/dev/null || die "python3 is required"
+
+_run_prompt() { # $1 = output file; writes the passphrase there; writes
+	#             "TIMEOUT" on timeout; rc 0 = ok, 1 = cancelled
+	local outf="$1"
+	[ -n "$outf" ] || return 2
+
+	local dir pid t=0 pw=""
+	dir="$(mktemp -d "${TMPDIR:-/tmp}/aetherprompt.XXXXXX")" || return 2
+	chmod 700 "$dir" || true
+
+	MSG_PROMPT="${MSG_PROMPT:-Enter passphrase}"
+	MSG_TITLE="${MSG_TITLE:-Passphrase required}"
+	MSG_DESC="${MSG_DESC:-}" MSG_ERROR="${MSG_ERROR:-}"
+	MSG_OK="${MSG_OK:-}" MSG_CANCEL="${MSG_CANCEL:-}"
+	MSG_TIMEOUT="${MSG_TIMEOUT:-0}" MSG_MASK="${MSG_MASK:-0}"
+	MSG_ICON="${MSG_ICON:-}"
+
+	python3 - "$dir/req.json" "$MSG_TITLE" "$MSG_DESC" "$MSG_PROMPT" \
+		"$MSG_ERROR" "$MSG_OK" "$MSG_CANCEL" "$MSG_TIMEOUT" "$MSG_MASK" "$MSG_ICON" <<'EOF' || die "json"
+import json, sys
+(path, title, desc, prompt, error, ok, cancel, timeout, mask, icon) = sys.argv[1:11]
+open(path, "w").write(json.dumps({
+    "title": title, "message": desc, "prompt": prompt, "error": error,
+    "okLabel": ok, "cancelLabel": cancel, "timeout": int(timeout or 0),
+    "masked": mask == "1", "icon": icon}, ensure_ascii=False))
+EOF
+
+	: >"$outf"
+	export AEP_DIR="$dir"
+	trap 'kill "$pid" 2>/dev/null' EXIT
+	AEP_DEBUG_LOG="${AEP_DEBUG_LOG:-}"
+	if [ -n "$AEP_DEBUG_LOG" ]; then
+		quickshell -p "$ROOT" -n >>"$AEP_DEBUG_LOG" 2>&1 &
+	else
+		quickshell -p "$ROOT" -n >/dev/null 2>&1 &
+	fi
+	pid=$!
+
+	# the QML dialog serves $dir/pass.sock; it sends "PASS <b64>", "CANCEL"
+	# or "TIMEOUT" over that socket so the passphrase never touches disk
+	pw="$(timeout 660 python3 "$ROOT/lib/sockrecv.py" "$dir/pass.sock" "$pid" 2>/dev/null)"
+
+	# let the UI finish its close animation, but never hang the caller
+	for t in 1 2 3 4 5 6 7 8 9 10; do
+		kill -0 "$pid" 2>/dev/null || break
+		sleep 0.1
+	done
+	kill -9 "$pid" 2>/dev/null || true
+	rm -rf "$dir"
+
+	[ -n "$AEP_DEBUG_LOG" ] && echo "aep: socket-status=${pw:0:4}" >>"$AEP_DEBUG_LOG"
+
+	case "$pw" in
+	PASS\ *)
+		# base64 -d outputs exactly the raw bytes: the newline the here-string
+		# appends goes into base64's *input* and is ignored, leaving the
+		# decoded stream untouched — so no head -c / byte stripping here
+		printf '%s' "${pw#PASS }" | base64 -d >"$outf"
+		return 0
+		;;
+	T*)
+		printf 'TIMEOUT\n' >"$outf"
+		return 1
+		;;
+	*) return 1 ;;
+	esac
+}
+
+mode_pinentry() {
+	local desc="" title="" prompt="" error="" ok="" cancel="" timeout=0
+	local AEP_PW_FILE
+	AEP_PW_FILE="$(mktemp "${TMPDIR:-/tmp}/aetherprompt-pw.XXXXXX")"
+	chmod 600 "$AEP_PW_FILE"
+	printf 'OK - aetherprompt pinentry ready\n'
+	local line
+	while IFS= read -r line || [ -n "$line" ]; do [ -z "$line" ] && line=OK
+		local cmd="${line%% *}" arg="${line#* }"
+		[ "$cmd" = "$line" ] && arg=""
+		case "$cmd" in
+		# state
+		SETDESC) desc="$arg" ;;
+		SETTITLE) title="$arg" ;;
+		SETPROMPT) prompt="${arg//_/ }" ;;
+		SETKEYINFO) : ;;
+		SETERROR) error="$arg" ;;
+		SETOK) ok="$arg" ;;
+		SETCANCEL) cancel="$arg" ;;
+		SETNOTOK | SETDATA | SETQUALITYBAR* | SETREPEAT* | SETLOCALE) : ;;
+		SETTIMEOUT) timeout="${arg}" ;;
+		# queries
+		GETINFO)
+			case "$arg" in
+			version) printf 'D aetherprompt 0.1\nOK\n' ;;
+			flavor) printf 'D aetherprompt\nOK\n' ;;
+			*) printf 'ERR 67109133 not implemented\n' ;;
+			esac
+			continue
+			;;
+		# confirmations — approximated with the normal prompt
+		CONFIRM | CONFIRM_PASSWORD*)
+			MSG_TITLE="${title:-Confirmation}" MSG_DESC="$desc"
+			MSG_PROMPT="${prompt:-Confirm}" MSG_ICON=checkbox
+			: >"$AEP_PW_FILE"
+			_run_prompt "$AEP_PW_FILE" >/dev/null
+			if [ -s "$AEP_PW_FILE" ]; then
+				printf 'OK\n'
+			else
+				printf 'ERR 83886179 cancelled\n'
+			fi
+			continue
+			;;
+		GETPIN)
+			MSG_TITLE="${title:-Passphrase required}" MSG_DESC="$desc"
+			MSG_PROMPT="${prompt:-Enter passphrase}" MSG_ERROR="$error"
+			MSG_OK="$ok" MSG_CANCEL="$cancel" MSG_TIMEOUT="$timeout" MSG_MASK=1
+			: >"$AEP_PW_FILE"
+			_run_prompt "$AEP_PW_FILE"
+			if [ -s "$AEP_PW_FILE" ] && [ "$(cat "$AEP_PW_FILE")" != "TIMEOUT" ]; then
+				local pw
+				# pinentry D-lines are percent-escaped; urllib handles %, LF, etc.
+				pw="$(python3 -c 'import sys, urllib.parse; sys.stdout.write(urllib.parse.quote(sys.stdin.read(), safe=""))' <"$AEP_PW_FILE")"
+				printf 'D %s\nOK\n' "$pw"
+			else
+				# timeout and cancel both read as "cancelled" to gpg-agent
+				printf 'ERR 102400 cancelled\n'
+			fi
+			: >"$AEP_PW_FILE"
+			continue
+			;;
+		RESET) desc=""; title=""; prompt=""; error=""; ok=""; cancel=""; timeout=0 ;;
+		BYE) printf 'OK closing connection\n'; exit 0 ;;
+		NOOP | OPTION* | CANCEL | HAVEKEYBOARDGRAB | GETPID | ...) printf 'OK\n' ;;
+		*) printf 'ERR 67108947 unknown IPC command\n' ;;
+		esac
+		# fallthrough reply after state sets
+		printf 'OK\n'
+	done
+}
+
+mode_askpass() {
+	# gnome-ssh-askpass compatibility: "keychain …" shows a friendlier label;
+	local label="" mask=0
+	case "${1:-general}" in
+	keychain*) label="SSH passphrase" ;;
+	esac
+	for a in "$@"; do
+		case "$a" in
+		--mask) mask=1 ;;
+		--plain) mask=0 ;;
+		--) ;;
+		-*) ;;
+		*) label="$a" ;;
+		esac
+	done
+	[ -n "${SSH_ASKPASS_SHOWSTARS:-}" ] && mask=1
+	MSG_PROMPT="${label:-Enter passphrase}" MSG_TITLE="Passphrase required"
+	MSG_MASK="$mask"
+	[ -n "${AEP_PROMPT:-}" ] && MSG_PROMPT="$AEP_PROMPT"
+	local pwf
+	pwf="$(mktemp "${TMPDIR:-/tmp}/aetherprompt-pw.XXXXXX")"
+	chmod 600 "$pwf"
+	: >"$pwf"
+	_run_prompt "$pwf"
+	local rc=$?
+	if [ "$(cat "$pwf" 2>/dev/null)" = "TIMEOUT" ]; then
+		die "timed out"
+	elif [ -s "$pwf" ]; then
+		cat "$pwf"
+		echo
+	fi
+	rm -f "$pwf"
+	exit $((rc == 0 ? 0 : 1))
+}
+
+case "${1:-}" in
+pinentry) shift; mode_pinentry "$@" ;;
+askpass | msg) shift; mode_askpass "$@" ;;
+aetherprompt) shift; mode_askpass "$@" ;; # invoked as ssh-askpass clone name
+*) mode_askpass "$@" ;; # ssh calls: argv[1] is a free-form prompt label
+esac
